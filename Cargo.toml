@@ -1,0 +1,13 @@
+[package]
+name = "vichare_data_store"
+version = "0.1.0"
+edition = "2024"
+description = "Typed, protobuf-backed storage shared by Vichare projects"
+
+[dependencies]
+prost = "0.14"
+redb = "2"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
