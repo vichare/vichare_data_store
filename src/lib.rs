@@ -7,7 +7,7 @@
 // Boxing the large redb transaction variant would break source compatibility.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,8 @@ pub enum DataStoreError {
     Encode(#[from] prost::EncodeError),
     #[error("key already exists in table {table}")]
     AlreadyExists { table: &'static str },
+    #[error("value precondition failed in table {table}")]
+    PreconditionFailed { table: &'static str },
 }
 
 /// Marker trait for protobuf message types that may be stored as values.
@@ -67,6 +69,7 @@ enum WriteOperation {
         key: Vec<u8>,
         value: Vec<u8>,
         require_absent: bool,
+        expected_value: Option<Vec<u8>>,
     },
     Remove {
         table: &'static str,
@@ -108,6 +111,7 @@ impl WriteBatch {
             key: key.into(),
             value: value.to_bytes()?,
             require_absent: false,
+            expected_value: None,
         });
         Ok(())
     }
@@ -130,6 +134,36 @@ impl WriteBatch {
             key: key.into(),
             value: value.to_bytes()?,
             require_absent: true,
+            expected_value: None,
+        });
+        Ok(())
+    }
+
+    /// Encodes and appends a replacement that requires an exact current value.
+    ///
+    /// Both values are encoded before a backend transaction begins. The
+    /// backend replaces the value only when the current encoded bytes exactly
+    /// equal `expected_value`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataStoreError::Encode`] when either value cannot be encoded.
+    /// [`AtomicWriteStore::apply_batch`] returns
+    /// [`DataStoreError::PreconditionFailed`] if the current value differs or
+    /// the key does not exist at commit time.
+    pub fn replace_if_equal<D: DataType>(
+        &mut self,
+        table: &'static str,
+        key: impl Into<Vec<u8>>,
+        expected_value: &D,
+        new_value: &D,
+    ) -> Result<(), DataStoreError> {
+        self.operations.push(WriteOperation::Put {
+            table,
+            key: key.into(),
+            value: new_value.to_bytes()?,
+            require_absent: false,
+            expected_value: Some(expected_value.to_bytes()?),
         });
         Ok(())
     }
@@ -192,6 +226,7 @@ impl AtomicWriteStore for Store {
                     key,
                     value,
                     require_absent,
+                    expected_value,
                 } => {
                     let table_name = table;
                     let definition: TableDefinition<&[u8], &[u8]> =
@@ -199,6 +234,14 @@ impl AtomicWriteStore for Store {
                     let mut table_handle = write.open_table(definition)?;
                     if require_absent && table_handle.get(key.as_slice())?.is_some() {
                         return Err(DataStoreError::AlreadyExists { table: table_name });
+                    }
+                    if let Some(expected_value) = expected_value {
+                        let current_value = table_handle
+                            .get(key.as_slice())?
+                            .map(|guard| guard.value().to_vec());
+                        if current_value.as_deref() != Some(expected_value.as_slice()) {
+                            return Err(DataStoreError::PreconditionFailed { table: table_name });
+                        }
                     }
                     table_handle.insert(key.as_slice(), value.as_slice())?;
                 }
@@ -392,36 +435,35 @@ impl MemoryStore {
 impl AtomicWriteStore for MemoryStore {
     fn apply_batch(&self, batch: WriteBatch) -> Result<(), DataStoreError> {
         let mut tables = self.inner.lock().expect("MemoryStore lock poisoned");
-        let mut inserted = BTreeSet::new();
-        for operation in &batch.operations {
-            if let WriteOperation::Put {
-                table,
-                key,
-                require_absent: true,
-                ..
-            } = operation
-            {
-                let exists = tables.get(table).is_some_and(|rows| rows.contains_key(key));
-                if exists || !inserted.insert((*table, key.clone())) {
-                    return Err(DataStoreError::AlreadyExists { table });
-                }
-            }
-        }
-
+        let mut candidate = tables.clone();
         for operation in batch.operations {
             match operation {
                 WriteOperation::Put {
-                    table, key, value, ..
+                    table,
+                    key,
+                    value,
+                    require_absent,
+                    expected_value,
                 } => {
-                    tables.entry(table).or_default().insert(key, value);
+                    let rows = candidate.entry(table).or_default();
+                    if require_absent && rows.contains_key(&key) {
+                        return Err(DataStoreError::AlreadyExists { table });
+                    }
+                    if let Some(expected_value) = expected_value
+                        && rows.get(&key) != Some(&expected_value)
+                    {
+                        return Err(DataStoreError::PreconditionFailed { table });
+                    }
+                    rows.insert(key, value);
                 }
                 WriteOperation::Remove { table, key } => {
-                    if let Some(rows) = tables.get_mut(table) {
+                    if let Some(rows) = candidate.get_mut(table) {
                         rows.remove(&key);
                     }
                 }
             }
         }
+        *tables = candidate;
         Ok(())
     }
 }
@@ -583,5 +625,53 @@ mod tests {
         ));
         assert_eq!(first.look_up(b"existing").unwrap(), Some(blob(b"old")));
         assert_eq!(second.look_up(b"new").unwrap(), None);
+    }
+
+    #[test]
+    fn memory_compare_and_swap_replaces_only_expected_value() {
+        let store = MemoryStore::new();
+        let table = store.table::<Blob>("records");
+        table.insert(b"key", &blob(b"v1")).unwrap();
+
+        let mut successful = WriteBatch::new();
+        successful
+            .replace_if_equal("records", b"key".to_vec(), &blob(b"v1"), &blob(b"v2"))
+            .unwrap();
+        store.apply_batch(successful).unwrap();
+        assert_eq!(table.look_up(b"key").unwrap(), Some(blob(b"v2")));
+
+        let mut stale = WriteBatch::new();
+        stale
+            .replace_if_equal("records", b"key".to_vec(), &blob(b"v1"), &blob(b"v3"))
+            .unwrap();
+        assert!(matches!(
+            store.apply_batch(stale),
+            Err(DataStoreError::PreconditionFailed { table: "records" })
+        ));
+        assert_eq!(table.look_up(b"key").unwrap(), Some(blob(b"v2")));
+    }
+
+    #[test]
+    fn redb_compare_and_swap_replaces_only_expected_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("cas.redb")).unwrap();
+        let table = RedbTable::<Blob>::open(store.clone(), "records").unwrap();
+        table.insert(b"key", &blob(b"v1")).unwrap();
+
+        let mut successful = WriteBatch::new();
+        successful
+            .replace_if_equal("records", b"key".to_vec(), &blob(b"v1"), &blob(b"v2"))
+            .unwrap();
+        store.apply_batch(successful).unwrap();
+
+        let mut stale = WriteBatch::new();
+        stale
+            .replace_if_equal("records", b"key".to_vec(), &blob(b"v1"), &blob(b"v3"))
+            .unwrap();
+        assert!(matches!(
+            store.apply_batch(stale),
+            Err(DataStoreError::PreconditionFailed { table: "records" })
+        ));
+        assert_eq!(table.look_up(b"key").unwrap(), Some(blob(b"v2")));
     }
 }
